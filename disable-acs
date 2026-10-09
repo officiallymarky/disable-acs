@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# Keep the kernel pci=disable_acs_redir parameter aligned with the NVIDIA GPUs that
+# are directly attached to PCIe root ports.
+#
+# Two boot backends are supported:
+#   GRUB         /etc/default/grub, regenerated with grub-mkconfig
+#   systemd-boot /boot/loader/entries/*.conf and /etc/kernel/cmdline
+#
+# Unified Kernel Images are not supported: their command line is built in.
+# No Python. Requires Bash, lspci (pciutils), standard coreutils.
+# By default: show live state and preview; --apply writes; --verify checks the kernel.
+set -euo pipefail
+
+SYSFS=${ACS_SYSFS:-/sys/bus/pci/devices}
+CMDLINE_FILE=${ACS_CMDLINE_FILE:-/proc/cmdline}
+
+# GRUB backend
+GRUB_DEFAULT=${ACS_GRUB_DEFAULT:-/etc/default/grub}
+GRUB_CFG=${ACS_GRUB_CFG:-/boot/grub/grub.cfg}
+
+# systemd-boot backend
+LOADER_DIR=${ACS_LOADER_DIR:-/boot/loader}
+ENTRIES_DIR=${ACS_LOADER_ENTRIES_DIR:-$LOADER_DIR/entries}
+KERNEL_CMDLINE=${ACS_KERNEL_CMDLINE:-/etc/kernel/cmdline}
+INSTALL_CONF=${ACS_KERNEL_INSTALL_CONF:-/etc/kernel/install.conf}
+UKI_GLOB=${ACS_UKI_GLOB:-/boot/EFI/Linux/*.efi}
+
+EXPECTED=4
+MODE=preview
+BOOTLOADER=auto
+SELF=${0##*/}
+RUN_TMP=$(mktemp -d) || exit 1
+TOKEN_PLAIN=    # kernel parameter as systemd-boot writes it (verbatim)
+TOKEN_GRUB=     # same parameter with the escaping GRUB requires
+
+usage() {
+  cat <<HELP
+Usage: sudo $SELF [--apply | --verify] [--bootloader auto|grub|systemd-boot]
+                        [--expect-gpus N]
+
+  (no flags)      Show detected GPUs, live ACS state, and proposed boot changes.
+  --apply         Back up the boot configuration and update the ACS parameter
+                  (no reboot).
+  --verify        Verify the active kernel parameter and the live ACS register
+                  values (bootloaders independent).
+  --bootloader B  Boot configuration to read and write (default: auto-detect).
+  --expect-gpus N Require at least N GPUs before changing anything (default: 4).
+
+Only supports NVIDIA display/3D GPUs directly attached to distinct PCIe root
+ports, and the GRUB and systemd-boot configurations described above. Requires
+pciutils (lspci), GRUB or systemd-boot, and standard Linux system tools.
+CAUTION: Disabling ACS redirection weakens PCIe/IOMMU device isolation.
+HELP
+}
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+cleanup() { rm -rf -- "$RUN_TMP"; return 0; }
+trap cleanup EXIT
+
+while (($#)); do
+  case $1 in
+    --apply) [[ $MODE == preview ]] || fail 'Choose one mode'; MODE=apply ;;
+    --verify|--status) [[ $MODE == preview ]] || fail 'Choose one mode'; MODE=verify ;;
+    --bootloader) shift; (($#)) || fail '--bootloader requires a value'; BOOTLOADER=$1 ;;
+    --expect-gpus) shift; (($#)) || fail '--expect-gpus requires a number'; EXPECTED=$1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) fail "Unknown argument: $1" ;;
+  esac
+  shift
+done
+[[ $EXPECTED =~ ^[0-9]+$ ]] && ((EXPECTED >= 1)) || fail 'Expected GPU count must be >= 1'
+case $BOOTLOADER in auto | grub | systemd-boot) ;; *) fail "Unknown bootloader: $BOOTLOADER" ;; esac
+((EUID == 0)) || fail 'Run with sudo to read complete PCIe ACS capabilities'
+command -v lspci >/dev/null || fail 'Missing lspci: sudo pacman -S pciutils'
+[[ -d $SYSFS ]] || fail "PCI device directory missing: $SYSFS"
+
+# GPU -> direct parent root port, from kernel PCI topology symlinks.
+declare -a GPU_BDFS=() GPU_PORTS=() PORTS=()
+declare -A SEEN=()
+for dev in "$SYSFS"/*; do
+  [[ -f $dev/vendor && -f $dev/class ]] || continue
+  read -r vendor < "$dev/vendor"
+  read -r class < "$dev/class"
+  vendor=${vendor,,}; class=${class,,}
+  [[ $vendor == 0x10de && $class == 0x03* ]] || continue
+  gpu=${dev##*/}
+  parent_path=$(readlink -f "$dev") || fail "Could not resolve sysfs path for $gpu"
+  parent=${parent_path%/*}
+  port=${parent##*/}
+  [[ $port =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$ ]] || fail "$gpu: no directly attached PCI root port ($port)"
+  port_dir="$SYSFS/$port"
+  [[ -f $port_dir/class ]] || fail "$gpu: parent $port is not a PCI device"
+  read -r port_class < "$port_dir/class"
+  [[ ${port_class,,} == 0x0604* ]] || fail "$gpu: parent $port is not a PCI bridge"
+  details=$(lspci -vv -s "$port") || fail "Cannot inspect $port"
+  [[ $details == *'Root Port'* ]] || fail "$gpu: $port is not a direct PCIe Root Port (switch/bridge topology unsupported)"
+  cap=$(grep -m1 'ACSCap:' <<< "$details" || true)
+  [[ $cap == *'ReqRedir+'* && $cap == *'CmpltRedir+'* ]] || fail "$port lacks ACS request/completion redirect capabilities"
+  [[ -z ${SEEN[$port]+x} ]] || fail "GPUs share root port $port; inspect topology manually"
+  SEEN[$port]=1
+  GPU_BDFS+=("$gpu"); GPU_PORTS+=("$port"); PORTS+=("$port")
+done
+((${#GPU_BDFS[@]})) || fail 'No NVIDIA display/3D GPUs enumerated'
+
+printf 'Detected NVIDIA GPUs and their direct root ports:\n'
+for i in "${!GPU_BDFS[@]}"; do
+  printf '  %-14s  ->  %s\n' "${GPU_BDFS[i]}" "${GPU_PORTS[i]}"
+done
+printf '\nActive ACS settings (read directly from PCI config space):\n'
+BAD=0
+for port in "${PORTS[@]}"; do
+  details=$(lspci -vv -s "$port") || fail "Cannot read ACS settings for $port"
+  ctl=$(grep -m1 'ACSCtl:' <<< "$details" || true)
+  [[ -n $ctl ]] || fail "$port: ACSCtl not readable"
+  if [[ $ctl == *'ReqRedir-'* && $ctl == *'CmpltRedir-'* ]]; then
+    printf '  %-14s  OK       ReqRedir- CmpltRedir-\n' "$port"
+  else
+    printf '  %-14s  ENABLED  %s\n' "$port" "${ctl#*ACSCtl:}"
+    BAD=1
+  fi
+done
+
+active_cmdline=$(<"$CMDLINE_FILE")
+active_param='(not set)'
+if [[ " $active_cmdline " =~ [[:space:]]pci=disable_acs_redir=([^[:space:]]+) ]]; then
+  active_param=${BASH_REMATCH[1]}
+fi
+printf '\nActive kernel parameter: %s\n' "$active_param"
+
+if ((${#GPU_BDFS[@]} < EXPECTED)); then
+  fail "Found ${#GPU_BDFS[@]} GPUs; expected >= $EXPECTED. Won't declare the full setup healthy while GPUs may be missing. Use --expect-gpus N if intentional."
+fi
+
+# Verify the running kernel, not only what the bootloader is configured to use next time.
+if [[ $MODE == verify ]]; then
+  missing=0
+  for port in "${PORTS[@]}"; do
+    case ";$active_param;" in
+      *";$port;"*) ;;
+      *) printf '  Missing from running kernel parameter: %s\n' "$port"; missing=1 ;;
+    esac
+  done
+  if ((BAD || missing)); then
+    printf '\nVERIFY FAILED: some GPU root ports still redirect or lack the active kernel option.\n' >&2
+    exit 1
+  fi
+  printf '\nVERIFY PASSED: all detected GPU root ports have ACS redirect disabled.\n'
+  exit 0
+fi
+
+# Stable ordering. Linux separates the BDFs with ';'; GRUB needs a backslash-escaped
+# semicolon in its configuration, while systemd-boot takes the value verbatim.
+mapfile -t sorted_ports < <(printf '%s\n' "${PORTS[@]}" | LC_ALL=C sort -u)
+joined=$(IFS=';'; printf '%s' "${sorted_ports[*]}")
+TOKEN_PLAIN="pci=disable_acs_redir=$joined"
+TOKEN_GRUB=${TOKEN_PLAIN//;/\\;}
+
+# Remove any previous ACS option(s) from a kernel command line value, keeping the rest.
+strip_acs() {
+  sed -E 's/(^|[[:space:]])pci=disable_acs_redir=[^[:space:]]+//g; s/[[:space:]]+$//' <<< "$1"
+}
+merge_token() {
+  local value=$1 token=$2
+  printf '%s%s%s' "$value" "${value:+ }" "$token"
+}
+
+# --- backups ------------------------------------------------------------------
+declare -a BACKUP_SRC=() BACKUP_DST=()
+backup_file() {
+  local path=$1 backup
+  backup="${path}.bak-$(date +%Y%m%d-%H%M%S)-$$"
+  cp -p -- "$path" "$backup" || fail "Cannot back up $path"
+  BACKUP_SRC+=("$path"); BACKUP_DST+=("$backup")
+  printf '  %s\n' "$backup"
+}
+restore_all() {
+  local i
+  for i in "${!BACKUP_SRC[@]}"; do
+    cp -p -- "${BACKUP_DST[i]}" "${BACKUP_SRC[i]}" ||
+      printf 'WARNING: could not restore %s from %s\n' "${BACKUP_SRC[i]}" "${BACKUP_DST[i]}" >&2
+  done
+  printf 'Restored original boot configuration files after failure.\n' >&2
+}
+# Replace a file with stdin, using its original metadata and an atomic rename.
+write_file() {
+  local path=$1 tmp
+  tmp="${path}.tmp-$$"
+  cp -p -- "$path" "$tmp" || fail "Cannot stage $path"
+  cat > "$tmp" || fail "Cannot write $path"
+  mv -f -- "$tmp" "$path" || fail "Cannot replace $path"
+}
+finish() {
+  printf '\n%s updated successfully. No reboot performed.\n' "$1"
+  printf 'After reboot: sudo %s --verify\n' "$SELF"
+}
+
+# --- GRUB backend -------------------------------------------------------------
+# Every generated Linux entry in a GRUB config must carry the parameter.
+check_grub_cfg() {
+  local file=$1 line count=0
+  while IFS= read -r line; do
+    [[ $line =~ ^[[:space:]]*linux[[:space:]] ]] || continue
+    ((count += 1))
+    [[ $line == *"$TOKEN_GRUB"* ]] || return 1
+  done < "$file"
+  ((count > 0))
+}
+
+apply_grub() {
+  [[ -f $GRUB_DEFAULT && -f $GRUB_CFG ]] || fail 'GRUB default or grub.cfg missing'
+  command -v grub-mkconfig >/dev/null || fail 'grub-mkconfig not found'
+
+  # Do not overwrite unusual/multiline GRUB files or silently conflict with other entries.
+  local count line value found=0
+  count=$(grep -Ec '^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_DEFAULT" || true)
+  [[ $count == 1 ]] || fail 'Expected exactly one GRUB_CMDLINE_LINUX_DEFAULT assignment'
+  if grep -E '^[[:space:]]*GRUB_CMDLINE_LINUX=' "$GRUB_DEFAULT" | grep -q 'disable_acs_redir'; then
+    fail 'ACS also appears in GRUB_CMDLINE_LINUX; remove the conflicting parameter manually'
+  fi
+
+  local new_default="$RUN_TMP/grub.defaults" preview="$RUN_TMP/grub.cfg.preview"
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line =~ ^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT= ]]; then
+      # Restrict this script to the standard, one-line double-quoted GRUB assignment.
+      [[ $line =~ ^GRUB_CMDLINE_LINUX_DEFAULT=\"([^\"]*)\"[[:space:]]*$ ]] || fail 'Nonstandard GRUB_CMDLINE_LINUX_DEFAULT format; edit manually'
+      value=$(strip_acs "${BASH_REMATCH[1]}")
+      printf 'GRUB_CMDLINE_LINUX_DEFAULT="%s"\n' "$(merge_token "$value" "$TOKEN_GRUB")" >> "$new_default"
+      found=1
+    else
+      printf '%s\n' "$line" >> "$new_default"
+    fi
+  done < "$GRUB_DEFAULT"
+  ((found)) || fail 'Could not locate GRUB defaults'
+
+  printf '\nDesired GRUB parameter:\n  %s\n' "$TOKEN_GRUB"
+  if cmp -s "$GRUB_DEFAULT" "$new_default" && check_grub_cfg "$GRUB_CFG"; then
+    printf '\nGRUB already up to date. No change needed.\n'
+    if ((BAD)); then
+      printf 'Note: live ACS registers are still enabled. Saved GRUB settings may need a reboot to take effect.\n'
+    fi
+    exit 0
+  fi
+  if [[ $MODE == preview ]]; then
+    printf '\nDRY RUN: GRUB needs updating. No files changed.\n'
+    printf 'Run: sudo %s --apply\n' "$SELF"
+    exit 0
+  fi
+
+  # Back up both files before editing, then validate a full GRUB preview.
+  printf '\nBackups:\n'
+  backup_file "$GRUB_DEFAULT"
+  backup_file "$GRUB_CFG"
+  write_file "$GRUB_DEFAULT" < "$new_default"
+  if ! grub-mkconfig > "$preview" || ! check_grub_cfg "$preview"; then
+    restore_all
+    fail 'GRUB preview failed verification; restored backups'
+  fi
+  if ! grub-mkconfig -o "$GRUB_CFG" || ! check_grub_cfg "$GRUB_CFG"; then
+    restore_all
+    fail 'GRUB configuration update failed; restored backups'
+  fi
+  finish GRUB
+}
+
+# --- systemd-boot backend -----------------------------------------------------
+# The 'options' line of a boot entry holds the kernel command line.
+check_entry() {
+  local file=$1 line options='' seen_linux=0
+  while IFS= read -r line; do
+    [[ $line =~ ^[[:space:]]*linux[[:space:]] ]] && seen_linux=1
+    [[ $line =~ ^[[:space:]]*options[[:space:]](.*)$ ]] && options=${BASH_REMATCH[1]}
+  done < "$file"
+  ((seen_linux)) || return 1
+  [[ $options == *"$TOKEN_PLAIN"* ]] || return 1
+  [[ $options != *'\;'* ]] || return 1
+}
+check_kernel_cmdline() {
+  [[ $(<"$KERNEL_CMDLINE") == *"$TOKEN_PLAIN"* ]]
+}
+
+apply_systemd_boot() {
+  local -a entries=()
+  local f
+  for f in "$ENTRIES_DIR"/*.conf; do
+    [[ -f $f ]] || continue
+    entries+=("$f")
+  done
+  ((${#entries[@]})) || fail "No boot entries found in $ENTRIES_DIR"
+
+  # A Unified Kernel Image has the command line built in at image build time, so
+  # there is nothing to patch: refuse rather than write a file nothing reads.
+  local layout='' entry_uki=''
+  if [[ -f $INSTALL_CONF ]]; then
+    layout=$(sed -nE 's/^[[:space:]]*layout[[:space:]]*=[[:space:]]*//p' "$INSTALL_CONF" | tail -n1)
+  fi
+  for f in "${entries[@]}"; do
+    entry_uki=$(sed -nE 's/^[[:space:]]*linux[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' "$f" | head -n1)
+    [[ $entry_uki == *.efi ]] && break
+    entry_uki=''
+  done
+  if [[ $layout == uki || -n $entry_uki ]] || compgen -G "$UKI_GLOB" >/dev/null; then
+    fail "Unified Kernel Image setup (layout=${layout:-unknown}${entry_uki:+, entry linux=$entry_uki}, $UKI_GLOB): the kernel command line is built into the image, so it cannot be patched here. Add '$TOKEN_PLAIN' to $KERNEL_CMDLINE and rebuild the images with 'mkinitcpio -P'."
+  fi
+
+  local -a changed=()
+  local -a skipped=()
+  local entry new_entry line value seen_linux options_found
+  for entry in "${entries[@]}"; do
+    seen_linux=0
+    while IFS= read -r line || [[ -n $line ]]; do
+      [[ $line =~ ^[[:space:]]*linux[[:space:]] ]] && seen_linux=1
+    done < "$entry"
+    if ((!seen_linux)); then
+      skipped+=("$entry")
+      continue
+    fi
+    new_entry="$RUN_TMP/$(basename "$entry").new"
+    options_found=0
+    while IFS= read -r line || [[ -n $line ]]; do
+      if [[ $line =~ ^[[:space:]]*options[[:space:]](.*)$ ]]; then
+        value=$(strip_acs "${BASH_REMATCH[1]}")
+        printf 'options %s\n' "$(merge_token "$value" "$TOKEN_PLAIN")" >> "$new_entry"
+        options_found=1
+      else
+        printf '%s\n' "$line" >> "$new_entry"
+      fi
+    done < "$entry"
+    ((options_found)) || printf 'options %s\n' "$TOKEN_PLAIN" >> "$new_entry"
+    cmp -s "$entry" "$new_entry" || changed+=("$entry")
+  done
+  ((${#skipped[@]})) && printf 'Skipping entries without a linux line: %s\n' "${skipped[*]}"
+
+  local kernel_cmdline_change=0
+  if [[ -f $KERNEL_CMDLINE ]]; then
+    local -a kc_lines=()
+    local -a kc_nonempty=()
+    mapfile -t kc_lines < "$KERNEL_CMDLINE"
+    for line in "${kc_lines[@]}"; do
+      if [[ -n ${line//[[:space:]]/} ]]; then kc_nonempty+=("$line"); fi
+    done
+    ((${#kc_nonempty[@]} <= 1)) || fail "Multiple lines in $KERNEL_CMDLINE; edit manually"
+    local kc_value=${kc_nonempty[0]:-} kc_new
+    kc_new=$(merge_token "$(strip_acs "$kc_value")" "$TOKEN_PLAIN")
+    if [[ $kc_new != "$kc_value" ]]; then
+      kernel_cmdline_change=1
+      printf '%s\n' "$kc_new" > "$RUN_TMP/kernel.cmdline"
+    fi
+  fi
+
+  printf '\nDesired kernel parameter:\n  %s\n' "$TOKEN_PLAIN"
+  if ((${#changed[@]} == 0)) && ((!kernel_cmdline_change)); then
+    printf '\nBoot entries already up to date. No change needed.\n'
+    if ((BAD)); then
+      printf 'Note: live ACS registers are still enabled. Saved settings may need a reboot to take effect.\n'
+    fi
+    exit 0
+  fi
+  printf '\nBoot configuration: systemd-boot\n'
+  for entry in "${changed[@]+"${changed[@]}"}"; do
+    printf '  update  %s\n' "$entry"
+  done
+  ((kernel_cmdline_change)) && printf '  update  %s\n' "$KERNEL_CMDLINE"
+  if [[ $MODE == preview ]]; then
+    printf '\nDRY RUN: boot entries need updating. No files changed.\n'
+    printf 'Run: sudo %s --apply\n' "$SELF"
+    exit 0
+  fi
+
+  local mount_target
+  if command -v findmnt >/dev/null && [[ -d $ENTRIES_DIR ]]; then
+    mount_target=$(findmnt -n -o SOURCE --target "$ENTRIES_DIR" 2>/dev/null || true)
+    if [[ $mount_target == "$(findmnt -n -o SOURCE --target / 2>/dev/null || true)" ]]; then
+      warn "$ENTRIES_DIR is on the root filesystem; if your ESP is not mounted, entries written now will be ignored at boot."
+    fi
+  fi
+
+  printf '\nBackups:\n'
+  for entry in "${changed[@]+"${changed[@]}"}"; do backup_file "$entry"; done
+  ((kernel_cmdline_change)) && backup_file "$KERNEL_CMDLINE"
+
+  for entry in "${changed[@]+"${changed[@]}"}"; do
+    write_file "$entry" < "$RUN_TMP/$(basename "$entry").new"
+    check_entry "$entry" || { restore_all; fail "$entry failed verification; restored backups"; }
+  done
+  if ((kernel_cmdline_change)); then
+    write_file "$KERNEL_CMDLINE" < "$RUN_TMP/kernel.cmdline"
+    check_kernel_cmdline || { restore_all; fail "$KERNEL_CMDLINE failed verification; restored backups"; }
+  fi
+  printf '\nNo bootloader regeneration needed: systemd-boot reads these files directly.\n'
+  ((kernel_cmdline_change)) && printf 'kernel-install will keep regenerated entries in sync with %s.\n' "$KERNEL_CMDLINE"
+  finish systemd-boot
+}
+
+# --- dispatch -----------------------------------------------------------------
+if [[ $BOOTLOADER == auto ]]; then
+  have_grub=0 have_sdboot=0
+  [[ -f $GRUB_DEFAULT && -f $GRUB_CFG ]] && have_grub=1
+  [[ -d $ENTRIES_DIR || -f $KERNEL_CMDLINE ]] && have_sdboot=1
+  if ((have_grub && have_sdboot)); then
+    fail "Both GRUB ($GRUB_DEFAULT, $GRUB_CFG) and systemd-boot ($ENTRIES_DIR, $KERNEL_CMDLINE) configurations are present; choose one with --bootloader"
+  elif ((have_grub)); then
+    BOOTLOADER=grub
+  elif ((have_sdboot)); then
+    BOOTLOADER=systemd-boot
+  else
+    fail "No supported boot configuration found: expected GRUB ($GRUB_DEFAULT with $GRUB_CFG) or systemd-boot ($ENTRIES_DIR with $KERNEL_CMDLINE)"
+  fi
+fi
+
+if [[ $BOOTLOADER == grub ]]; then
+  apply_grub
+else
+  apply_systemd_boot
+fi
